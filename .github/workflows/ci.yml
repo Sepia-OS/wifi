@@ -1,0 +1,147 @@
+name: CI
+
+# Every commit on every branch, every pull request against main, and the push
+# that lands when a pull request is merged into main.
+#
+# Tag pushes deliberately do not match: `branches:` never matches a tag ref, so
+# cutting a release cannot start a second pipeline for the commit it just built.
+on:
+  push:
+    branches: ['**']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Supersede the previous run for the same branch or PR. A branch that also has
+# an open PR gets one run per event in two separate groups, so neither run can
+# cancel the other's checks out from under branch protection.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # -------------------------------------------------------------------------
+  # The whole build, on every commit: fetch and prove the cross-compiler, fetch
+  # the musl sysroot from Sepia-OS/musl, cross-build libnl and wpa_supplicant
+  # against it, stage what ships and pack it.
+  #
+  # One job rather than several because every step depends on the tree the
+  # previous one left behind, and this build is fast enough that splitting it
+  # would cost more in artifact shuttling than it saved. Measured on macOS:
+  # about 15 s for both builds. Nearly all of the wall-clock here is the
+  # cross-toolchain download, not the compile.
+  #
+  # `release.yml` is triggered by hand, but it looks for a successful run of
+  # this workflow on the commit being released and refuses to publish without
+  # one - so this job is the gate a release passes.
+  # -------------------------------------------------------------------------
+  build:
+    name: cross-build the wifi userspace
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # The container the sibling repositories build in. Releases are cut on
+    # Linux because the cross-toolchain vendor - and therefore the binaries -
+    # differs by build host, so CI builds on the host that cuts the release.
+    #
+    # NOTE: on Linux the Makefile takes bootlin's toolchain, where a
+    # development machine takes messense's. This workflow is the first thing
+    # that has ever exercised that path; the build was verified on macOS.
+    container: debian:trixie-slim
+    # The Makefile asks api.github.com which musl release to build against.
+    # Unauthenticated that is 60 requests an hour *per IP*, and hosted runners
+    # share their egress addresses with every other job on the platform, so the
+    # budget is routinely already spent by someone else. The automatic per-run
+    # token raises it to 1000 an hour for this repository.
+    env:
+      GITHUB_TOKEN: ${{ github.token }}
+    steps:
+      # Before checkout on purpose: without git in the container,
+      # actions/checkout silently falls back to downloading a tarball.
+      #
+      # jq reads the Sepia-OS/musl release metadata from the GitHub API - this
+      # is the first package repository that consumes a sibling release rather
+      # than building its own musl, so it is the first that needs it.
+      #
+      # No compiler in this list, and that is not an oversight: everything is
+      # compiled by the downloaded cross-toolchain. ../e2fsprogs needs
+      # `gcc libc6-dev` because it compiles and runs helper programs on the
+      # build machine; nothing here does. pkg-config is absent on purpose too -
+      # libnl's configure wants one and the Makefile writes a stub.
+      #
+      # xz-utils is not optional: bootlin ships its toolchain as .tar.xz and
+      # `make dist` packs with xz -9.
+      - name: Install build tools
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends \
+            make git curl ca-certificates jq xz-utils
+
+      - uses: actions/checkout@v5
+
+      - name: Fetch the cross-toolchain
+        run: make toolchain
+
+      # Checked rather than assumed, and checked before anything expensive: a
+      # toolchain for the wrong host extracts happily and then fails to exec,
+      # and one for the wrong target compiles happily and produces the wrong
+      # binaries.
+      - name: Prove it builds C for aarch64
+        run: make toolchain-check
+
+      # Before anything is compiled: the libc these binaries will run against.
+      # A Sepia-OS/musl that has published nothing, or an asset that will not
+      # verify, should say so in seconds rather than after libnl has built.
+      - name: Fetch the musl sysroot
+        run: make musl
+
+      # Says that somebody else's libc and this repository's cross-toolchain
+      # work together, which is a thing neither side can test alone.
+      - name: Link C against the sysroot, both ways
+        run: make musl-check
+
+      # `make wifi`: the aggregate goal is named after the product, as the
+      # siblings' are. libnl first, then wpa_supplicant against it.
+      - name: Cross-build libnl and wpa_supplicant
+        run: make wifi
+
+      - name: Stage what ships
+        run: make stage
+
+      # Reads all five staged files back: aarch64, on the musl loader, and with
+      # every library they name either the card's libc or a file in this asset.
+      - name: Verify the staged tree
+        run: make stage-check
+
+      # Run here too, so the release path is exercised on every commit rather
+      # than for the first time during a release.
+      - name: Pack the release asset
+        run: make dist
+
+      - name: What was built
+        run: make toolchain-info musl-info wifi-info stage-info dist-info
+
+      # The asset is ~348 KB. Uploading it from every branch is nearly free and
+      # is the only way anyone gets a build onto a real board - which is still
+      # the one thing neither this workflow nor the Makefile can prove.
+      - uses: actions/upload-artifact@v5
+        with:
+          name: sepiaos-wifi
+          path: dist/
+          compression-level: 0
+          if-no-files-found: error
+
+      # configure and make are noisy and only interesting when they fail, so
+      # the Makefile sends them to a log and surfaces only the tail. The full
+      # logs are what a failure actually needs.
+      - name: Upload the build logs
+        if: failure()
+        uses: actions/upload-artifact@v5
+        with:
+          name: build-logs
+          path: |
+            build/src/*/configure.log
+            build/src/*/build.log
+          if-no-files-found: ignore
